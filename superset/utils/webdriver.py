@@ -16,11 +16,11 @@
 # under the License.
 
 import logging
+from enum import Enum
 from time import sleep
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from flask import current_app
-from retry.api import retry_call
 from selenium.common.exceptions import (
     StaleElementReferenceException,
     TimeoutException,
@@ -33,6 +33,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from superset.extensions import machine_auth_provider_factory
+from superset.utils.retries import retry_call
 
 WindowSize = Tuple[int, int]
 logger = logging.getLogger(__name__)
@@ -40,6 +41,12 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from flask_appbuilder.security.sqla.models import User
+
+
+class DashboardStandaloneMode(Enum):
+    HIDE_NAV = 1
+    HIDE_NAV_AND_TITLE = 2
+    REPORT = 3
 
 
 class WebDriverProxy:
@@ -85,7 +92,7 @@ class WebDriverProxy:
         # This is some very flaky code in selenium. Hence the retries
         # and catch-all exceptions
         try:
-            retry_call(driver.close, tries=tries)
+            retry_call(driver.close, max_tries=tries)
         except Exception:  # pylint: disable=broad-except
             pass
         try:
@@ -96,6 +103,13 @@ class WebDriverProxy:
     def get_screenshot(
         self, url: str, element_name: str, user: "User",
     ) -> Optional[bytes]:
+
+        from requests.models import PreparedRequest
+
+        params = {"standalone": DashboardStandaloneMode.REPORT.value}
+        req = PreparedRequest()
+        req.prepare_url(url, params)
+        url = req.url or ""
 
         driver = self.auth(user)
         driver.set_window_size(*self._window)
@@ -114,13 +128,24 @@ class WebDriverProxy:
             WebDriverWait(driver, self._screenshot_load_wait).until_not(
                 EC.presence_of_all_elements_located((By.CLASS_NAME, "loading"))
             )
+            logger.debug("Wait for chart to have content")
+            WebDriverWait(driver, self._screenshot_locate_wait).until(
+                EC.visibility_of_all_elements_located(
+                    (By.CLASS_NAME, "slice_container")
+                )
+            )
+            selenium_animation_wait = current_app.config[
+                "SCREENSHOT_SELENIUM_ANIMATION_WAIT"
+            ]
+            logger.debug("Wait %i seconds for chart animation", selenium_animation_wait)
+            sleep(selenium_animation_wait)
             logger.info("Taking a PNG screenshot or url %s", url)
             img = element.screenshot_as_png
         except TimeoutException:
-            logger.error("Selenium timed out requesting url %s", url, exc_info=True)
+            logger.warning("Selenium timed out requesting url %s", url, exc_info=True)
         except StaleElementReferenceException:
             logger.error(
-                "Selenium timed out while waiting for chart(s) to load %s",
+                "Selenium got a stale element while requesting url %s",
                 url,
                 exc_info=True,
             )
